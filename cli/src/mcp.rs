@@ -2163,10 +2163,49 @@ fn is_open_world_tool(name: &str) -> bool {
     )
 }
 
-fn is_known_tool(name: &str) -> bool {
-    tools()
+fn find_tool<'a>(tools: &'a [Value], name: &str) -> Option<&'a Value> {
+    tools
         .iter()
-        .any(|tool| tool.get("name").and_then(|v| v.as_str()) == Some(name))
+        .find(|tool| tool.get("name").and_then(|v| v.as_str()) == Some(name))
+}
+
+/// Reject argument keys that the tool's input schema does not declare.
+///
+/// Every tool schema sets `additionalProperties: false`, but handlers only read
+/// the keys they know. Without this check a misspelled key (for example
+/// `tabId` instead of `tab` on `tab_close`) is silently dropped and the tool
+/// runs with its defaults.
+fn reject_unknown_arguments(
+    name: &str,
+    tool: &Value,
+    arguments: &Value,
+) -> Result<(), ProtocolError> {
+    let Some(provided) = arguments.as_object() else {
+        return Ok(());
+    };
+    let Some(properties) = tool
+        .pointer("/inputSchema/properties")
+        .and_then(|v| v.as_object())
+    else {
+        return Ok(());
+    };
+    let mut unknown: Vec<&str> = provided
+        .keys()
+        .map(String::as_str)
+        .filter(|key| !properties.contains_key(*key))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    unknown.sort_unstable();
+    let mut valid: Vec<&str> = properties.keys().map(String::as_str).collect();
+    valid.sort_unstable();
+    Err(ProtocolError::invalid_params(format!(
+        "Unknown argument(s) for {}: {}. Valid arguments: {}",
+        name,
+        unknown.join(", "),
+        valid.join(", ")
+    )))
 }
 
 fn wait_tool(
@@ -2198,12 +2237,13 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         .ok_or_else(|| ProtocolError::invalid_params("tools/call params.name must be a string"))?;
     let arguments = params.get("arguments").unwrap_or(&Value::Null);
 
-    if !is_known_tool(name) {
+    let tool_list = tools();
+    let Some(tool) = find_tool(&tool_list, name) else {
         return Err(ProtocolError::invalid_params(format!(
             "Unknown tool: {}",
             name
         )));
-    }
+    };
 
     if !config.allows(name) {
         return Err(ProtocolError::invalid_params(format!(
@@ -2212,6 +2252,8 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
             config.profile_names().join(", ")
         )));
     }
+
+    reject_unknown_arguments(name, tool, arguments)?;
 
     match name {
         TOOL_TOOLS_PROFILES => call_tools_profiles(config),
@@ -4573,6 +4615,41 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, -32602);
         assert!(err.message.contains("not enabled"));
+    }
+
+    fn unknown_argument_error(name: &str, arguments: Value) -> ProtocolError {
+        call_tool(
+            Some(&json!({ "name": name, "arguments": arguments })),
+            &McpConfig::all(),
+        )
+        .unwrap_err()
+    }
+
+    #[test]
+    fn call_tool_rejects_unknown_arguments_for_tab_tools() {
+        let err = unknown_argument_error(TOOL_TAB_CLOSE, json!({ "tabId": "t13" }));
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("tabId"), "{}", err.message);
+        let valid = err.message.split("Valid arguments: ").nth(1).unwrap();
+        assert!(valid.split(", ").any(|k| k == "tab"), "{}", err.message);
+    }
+
+    #[test]
+    fn call_tool_rejects_unknown_arguments_for_selector_and_open_tools() {
+        let err = unknown_argument_error(TOOL_CLICK, json!({ "selector": "@e1", "bogus": true }));
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("bogus"), "{}", err.message);
+        let err = unknown_argument_error(TOOL_OPEN, json!({ "uri": "https://example.com" }));
+        assert_eq!(err.code, -32602);
+        assert!(err.message.contains("uri"), "{}", err.message);
+    }
+
+    #[test]
+    fn reject_unknown_arguments_accepts_declared_and_common_keys() {
+        let tool_list = tools();
+        let tool = find_tool(&tool_list, TOOL_CLICK).unwrap();
+        let args = json!({ "selector": "@e1", "session": "s", "timeoutMs": 5 });
+        reject_unknown_arguments(TOOL_CLICK, tool, &args).unwrap();
     }
 
     #[test]
