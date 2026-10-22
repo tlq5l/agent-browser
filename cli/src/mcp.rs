@@ -4982,7 +4982,7 @@ mod tests {
             tab_new["inputSchema"]["properties"]["label"]["pattern"],
             "^[A-Za-z][A-Za-z0-9_-]*$"
         );
-        // Each case is accepted by that pattern exactly when is_valid_label accepts it.
+        // These cases pin is_valid_label; the schema pattern above states the same rule and must change with it.
         for (label, valid) in [
             ("docs", true),
             ("Docs", true),
